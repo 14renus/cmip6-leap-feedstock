@@ -1,195 +1,149 @@
-### needs to be here otherwise the import fails
-"""Modified transforms from Pangeo Forge"""
+import glob
+import logging
+import os
+import re
+import shutil  # For cleanup
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 import apache_beam as beam
-from pangeo_forge_esgf import setup_logging
-from leap_data_management_utils.data_management_transforms import Copy, InjectAttrs
+import xarray as xr
+from apache_beam.options.pipeline_options import PipelineOptions
 from leap_data_management_utils.cmip_transforms import (
-    TestDataset,
     Preprocessor,
     dynamic_chunking_func,
-    CMIPBQInterface,
-    LogCMIPToBigQuery,
-)
-from pangeo_forge_esgf.async_client import (
-    ESGFAsyncClient,
-    get_sorted_http_urls_from_iid_dict,
 )
 from pangeo_forge_recipes.patterns import pattern_from_file_sequence
 from pangeo_forge_recipes.transforms import (
+    ConsolidateDimensionCoordinates,
+    # CheckpointFileTransfer,
+    ConsolidateMetadata,
     OpenURLWithFSSpec,
     OpenWithXarray,
     StoreToZarr,
-    ConsolidateMetadata,
-    ConsolidateDimensionCoordinates,
-    # CheckpointFileTransfer,
 )
-from pangeo_forge_recipes.storage import CacheFSSpecTarget
 
-import logging
-import asyncio
-import os
-import yaml
-import gcsfs
-
+# Set up logging for Beam within the notebook
 logger = logging.getLogger(__name__)
-
-## Create recipes
-is_test = (
-    os.environ["IS_TEST"] == "true"
-)  # There must be a better way to do this, but for now this will do
-print(f"{is_test =}")
-
-run_id = os.environ["GITHUB_RUN_ID"]
-run_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
-
-if is_test:
-    setup_logging("DEBUG")
-    copy_target_prefix = "gs://leap-scratch/data-library/cmip6-pr-copied/"
-    iid_file = "feedstock/iids_pr.yaml"
-    prune_iids = True
-    prune_submission = (
-        True  # if set, only submits a subset of the iids in the final step
-    )
-    table_id = "leap-pangeo.testcmip6.cmip6_consolidated_testing_pr"
-    print(f"{table_id = } {prune_submission = } {iid_file = }")
-
-    ## make sure the tables are deleted before running so we can run the same iids over and over again
-    ## TODO: this could be integtrated in the CMIPBQInterface class
-    from google.cloud import bigquery
-
-    client = bigquery.Client()
-    for table in [table_id]:
-        client.delete_table(table, not_found_ok=True)  # Make an API request.
-        print("Deleted table '{}'.".format(table))
-    del client
-
-else:
-    setup_logging("INFO")
-    copy_target_prefix = "gs://cmip6/cmip6-pgf-ingestion-test/zarr_stores/"
-    iid_file = "feedstock/iids.yaml"
-    prune_iids = False
-    prune_submission = (
-        False  # if set, only submits a subset of the iids in the final step
-    )
-    # TODO: rename these more cleanly when we move to the official bucket
-    table_id = "leap-pangeo.testcmip6.cmip6_consolidated_manual_testing"  # TODO rename to `leap-pangeo.cmip6_pgf_ingestion.cmip6`
-    print(f"{table_id = } {prune_submission = } {iid_file = }")
-
-print("Running with the following parameters:")
-print(f"{copy_target_prefix = }")
-print(f"{iid_file = }")
-print(f"{prune_iids = }")
-print(f"{prune_submission = }")
-print(f"{table_id = }")
-
-# load iids from file
-with open(iid_file) as f:
-    iids_raw = yaml.safe_load(f)
-    iids_raw = [iid for iid in iids_raw if iid]
-
-# parse out wildcard/square brackets using pangeo-forge-esgf
-logger.debug(f"{iids_raw = }")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
+# Suppress xarray warning about unclosed files which can be common with many small files
+xr.set_options(warn_for_unclosed_files=False)
 
 
-async def parse_iids():
-    async with ESGFAsyncClient() as client:
-        return await client.expand_iids(iids_raw)
+def extract_parent_stem(f, n=8):
+    """
+    Extracts the parent directory names up to n levels up from the file path.
+    Returns a string with the directory names joined by '/'.
+    E.g., for a file path like '/path/to/my/data/file.nc', it returns
+    '/to/my/data' if n=3.
+    """
+    stems = []
+    for i in range(n):
+        stem = Path(f).parent.name
+        stems.append(stem)
+        f = Path(f).parent
+
+    return "/".join(stems[::-1])
 
 
-iids = asyncio.run(parse_iids())
-logger.info(f"Submitted {iids = }")
-
-# Prune the url dict to only include items that have not been logged to BQ yet
-logger.info("Pruning iids that already exist")
-bq_interface = CMIPBQInterface(table_id=table_id)
-
-# TODO: Move this back to the BQ client https://github.com/leap-stc/leap-data-management-utils/issues/33
-# Since we have more than 10k iids to check against the big query database,
-# we need to run this in batches (bq does not take more than 10k inputs per query).
-iids_in_table = bq_interface.iid_list_exists(iids)
-
-# manual overrides (these will be rewritten each time as long as they exist here)
-overwrite_iids = [
-    # 'CMIP6.HighResMIP.NERC.HadGEM3-GC31-HH.hist-1950.r1i1p1f1.Omon.thetao.gn.v20200514',
-    #  'CMIP6.HighResMIP.NERC.HadGEM3-GC31-HH.hist-1950.r1i1p1f1.Omon.so.gn.v20200514'
-]
-
-# beam does NOT like to pickle client objects (https://github.com/googleapis/google-cloud-python/issues/3191#issuecomment-289151187)
-del bq_interface
-
-# Maybe I want a more finegrained check here at some point, but for now this will prevent logged iids from rerunning
-logger.debug(f"{overwrite_iids =}")
-iids_to_skip = set(iids_in_table) - set(overwrite_iids)
-logger.debug(f"{iids_to_skip =}")
-iids_filtered = list(set(iids) - iids_to_skip)
-logger.info(f"Pruned {len(iids) - len(iids_filtered)}/{len(iids)} iids from input list")
-
-if prune_iids:
-    iids_filtered = iids_filtered[0:20]
-
-print(f"🚀 Requesting a total of {len(iids_filtered)} datasets")
+def get_subdirectories_by_pattern(directory_pattern):
+    """
+    Gets directories matching a specific pattern.
+    E.g., './my_data_root/project_*' to find 'project_A', 'project_B'.
+    """
+    matched_paths = glob.glob(directory_pattern)
+    directories = [p for p in matched_paths if os.path.isdir(p) and ".zarr" not in p]
+    return directories
 
 
-async def get_recipe_inputs():
-    async with ESGFAsyncClient() as client:
-        return await client.recipe_data(iids_filtered)
-
-
-recipe_data = asyncio.run(get_recipe_inputs())
-logger.info(f"Got urls for iids: {list(recipe_data.keys())}")
-
-if prune_submission:
-    recipe_data = {i: recipe_data[i] for i in list(recipe_data.keys())[0:5]}
-
-logger.info(f"🚀 Submitting a total of {len(recipe_data)} iids")
-
-# Print the actual data
-logger.debug(f"{recipe_data=}")
-
-## Create the recipes
-recipes = {}
-
-cache_target = CacheFSSpecTarget(
-    fs=gcsfs.GCSFileSystem(),
-    root_path="gs://leap-scratch/data-library/cmip6-pgf-ingestion/cache",
-)
-
-for iid, data in recipe_data.items():
-    urls = get_sorted_http_urls_from_iid_dict(data)
-    pattern = pattern_from_file_sequence(urls, concat_dim="time")
-    recipes[iid] = (
-        f"Creating {iid}" >> beam.Create(pattern.items())
-        # | CheckpointFileTransfer(
-        #     transfer_target=cache_target,
-        #     max_executors=10,
-        #     concurrency_per_executor=4,
-        #     initial_backoff=3.0,  # Try with super long backoff and
-        #     backoff_factor=2.0,
-        #     fsspec_sync_patch=False,
-        # )
-        | OpenURLWithFSSpec(
-            cache=cache_target,
-            # fsspec_sync_patch=True
+def get_file_paths(directory, file_extension="*.nc"):
+    """
+    Generates file paths for xarray datasets in the given directory.
+    Adjust file extension pattern as needed (e.g., '*.nc', '*.grib', '*.zarr').
+    For this example, we'll look for NetCDF files.
+    """
+    search_pattern = os.path.join(directory, "**", file_extension)
+    file_paths = glob.glob(search_pattern, recursive=True)
+    if not file_paths:
+        logging.warning(
+            f"No files found matching '{search_pattern}' in directory '{directory}'. "
+            "Please ensure your data files are present and match the pattern."
         )
+    return file_paths
+
+
+def open_with_xarray(filepath: str, load: bool = False, xarray_open_kwargs: Optional[dict] = None) -> xr.Dataset:
+    """
+    Reads an xarray Dataset from a given file path.
+    Returns a tuple: (filepath, dataset).
+    TODO: Should we use dask for lazy loading to prevent immediate memory issues.
+    """
+    # Use dask for lazy loading to handle large datasets more efficiently
+    dataset = xr.open_dataset(filepath)  # , chunks='auto')
+    if load:
+        dataset.load()
+    logging.debug(f"Successfully read dataset from {filepath}")
+    return dataset
+
+
+@dataclass
+class OpenWithXarray(beam.PTransform):
+    """Open indexed items with Xarray. Accepts either fsspec open-file-like objects
+    or string URLs that can be passed directly to Xarray.
+
+    :param file_type: Provide this if you know what type of file it is.
+    :param load: Whether to eagerly load the data into memory ofter opening.
+    :param copy_to_local: Whether to copy the file-like-object to a local path
+       and pass the path to Xarray. Required for some file types (e.g. Grib).
+       Can only be used with file-like-objects, not URLs.
+    :param xarray_open_kwargs: Extra arguments to pass to Xarray's open function.
+    """
+
+    # file_type: FileType = FileType.unknown
+    load: bool = False
+    copy_to_local: bool = False
+    xarray_open_kwargs: Optional[dict] = field(default_factory=dict)
+
+    def expand(self, pcoll):
+        return pcoll | "Open with Xarray" >> beam.MapTuple(
+            lambda k, v: (
+                k,
+                open_with_xarray(
+                    v,
+                    # file_type=self.file_type,
+                    load=self.load,
+                    # copy_to_local=self.copy_to_local,
+                    xarray_open_kwargs=self.xarray_open_kwargs,
+                ),
+            )
+        )
+
+
+recipes = {}
+input_directory = "/usr/local/google/home/singhren/coding/data/cmip6/raw/CMIP6/CMIP/*/*/*/*/*/*"
+
+for dir in get_subdirectories_by_pattern(input_directory):
+    logger.info(dir)
+    file_paths = sorted(get_file_paths(dir))
+    output_zarr_file = re.sub(r"_\d{6}-\d{6}.nc$", ".zarr", Path(file_paths[0]).name)
+    output_zarr_path = Path(extract_parent_stem(file_paths[0], n=8)) / output_zarr_file
+
+    logger.info(f"File paths found: {file_paths}")
+    pattern = pattern_from_file_sequence(file_paths, concat_dim="time")
+    for k, v in pattern.items():
+        logger.info(f"Pattern item: {k} -> {v}")
+
+    recipes[dir] = (
+        f"Creating {dir}" >> beam.Create(pattern.items())
         | OpenWithXarray(xarray_open_kwargs={"use_cftime": True})
         | Preprocessor()
         | StoreToZarr(
-            store_name=f"{iid}.zarr",
+            # target_root=dir.replace("raw", "zarr"),
+            store_name=str(output_zarr_path),
             combine_dims=pattern.combine_dim_keys,
             dynamic_chunking_fn=dynamic_chunking_func,
         )
-        | InjectAttrs({"pangeo_forge_api_responses": data})
-        | ConsolidateDimensionCoordinates()
+        | ConsolidateDimensionCoordinates()  # Consolidate into one chunk.
         | ConsolidateMetadata()
-        | Copy(
-            target=os.path.join(
-                copy_target_prefix, f"{run_id}_{run_attempt}", f"{iid}.zarr"
-            )
-        )
-        | "Logging to bigquery (non-QC)"
-        >> LogCMIPToBigQuery(iid=iid, table_id=table_id, tests_passed=False)
-        | TestDataset(iid=iid)
-        | "Logging to bigquery (QC)"
-        >> LogCMIPToBigQuery(iid=iid, table_id=table_id, tests_passed=True)
     )
