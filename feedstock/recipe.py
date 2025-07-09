@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s -
 xr.set_options(warn_for_unclosed_files=False)
 
 
-def extract_parent_stem(f, n=8):
+def extract_parent_stem(f, n=9):
     """
     Extracts the parent directory names up to n levels up from the file path.
     Returns a string with the directory names joined by '/'.
@@ -121,13 +121,13 @@ class OpenWithXarray(beam.PTransform):
 
 
 recipes = {}
-input_directory = "/usr/local/google/home/singhren/coding/data/cmip6/raw/CMIP6/CMIP/*/*/*/*/*/*"
+input_directory = "/usr/local/google/home/singhren/coding/data/cmip6/raw/CMIP6/ScenarioMIP/*/*/*/*/*/*"
 
 for dir in get_subdirectories_by_pattern(input_directory):
     logger.info(dir)
     file_paths = sorted(get_file_paths(dir))
     output_zarr_file = re.sub(r"_\d{6}-\d{6}.nc$", ".zarr", Path(file_paths[0]).name)
-    output_zarr_path = Path(extract_parent_stem(file_paths[0], n=8)) / output_zarr_file
+    output_zarr_path = Path(extract_parent_stem(file_paths[0], n=9)) / output_zarr_file
 
     logger.info(f"File paths found: {file_paths}")
     pattern = pattern_from_file_sequence(file_paths, concat_dim="time")
